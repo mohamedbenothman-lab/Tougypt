@@ -2,11 +2,15 @@
 
 How the data works (found by checking the validation labels; see SUBMISSION.md):
 
-* Every task has its own duration. Per-task models learn it from the labelled validation week
-  (gradient boosting, absolute-error loss).
-* The staff tasks of one car are split across the branch's `staff_on_duty` workers, longest task
-  first (LPT list scheduling). Electric charging runs in parallel on the charger.
-  makespan = max(LPT(staff tasks, staff_on_duty), charging)
+* Every task has its own duration, and the effects add up (a child seat adds the same ~7.5 min of
+  interior cleaning at every dirt level). Frequent tasks use additive median regressions learned from
+  the labelled validation week; quick damage repair also learns from durations backed out of the
+  `train.csv` totals, and tyre checks use a median per branch staffing level.
+* The staff tasks of one car are split across the branch's `staff_on_duty` workers by a fixed rule
+  (see `staff_schedule`): a repair comes first (after the damage check, with the car alone), the other
+  tasks are handed out in a fixed order to whichever worker is free first, and interior cleaning waits
+  for special cleaning. Electric charging runs in parallel on the charger.
+  makespan = max(staff schedule, charging)
 * Before work starts, a car waits for the cars already queued at the branch, roughly 12 min / staff
   per car ahead. Service times in that queue are random, so the wait is estimated from the branch's
   recent arrivals and how close closing time is (a model trained on the `train.csv` totals).
@@ -24,6 +28,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import HistGradientBoostingRegressor
+from sklearn.linear_model import QuantileRegressor
 
 SEED = 0
 TASKS = [
@@ -140,19 +145,46 @@ def _task_matrix(df: pd.DataFrame, branches: pd.DataFrame, branch_levels: list[s
 TASK_CATS = ["branch"] + list(CAT_LEVELS)
 
 
-def lpt_makespan(durations: np.ndarray, staff: np.ndarray) -> np.ndarray:
-    """Longest-processing-time-first list scheduling of each row's tasks on `staff` workers."""
-    d = -np.sort(-durations, axis=1)
-    n = len(d)
-    kmax = int(staff.max()) if n else 1
-    loads = np.zeros((n, kmax))
-    loads[np.arange(kmax)[None, :] >= staff[:, None]] = np.inf  # workers that do not exist
+# Within-car schedule, found in the validation labels (it reproduces 97-98% of the totals of cars that
+# arrived at a quiet branch exactly, against 82% for longest-task-first):
+#  * a quick damage repair comes first: damage check, then the repair, with the car alone;
+#  * the other staff tasks are then handed out in this fixed order, each to whichever worker is free first;
+#  * interior cleaning waits until special cleaning is finished (both happen inside the car);
+#  * electric charging runs alongside on the charger (handled by the caller).
+TASK_ORDER = ["exterior", "special_cleaning", "tyre_check", "interior_cleaning", "damage_check", "refuel"]
+
+
+def staff_schedule(d: dict, staff: np.ndarray) -> np.ndarray:
+    """Minutes until the staff tasks of each car are done. `d` maps task name -> durations (0 = not done)."""
+    n = len(staff)
+    if n == 0:
+        return np.zeros(0)
+    repair, check = d["quick_damage_repair"], d["damage_check"]
+    t0 = np.where(repair > 0, check + repair, 0.0)
+    jobs = {
+        "exterior": d["quick_exterior_cleaning"] + d["normal_exterior_cleaning"],
+        "special_cleaning": d["special_cleaning"], "tyre_check": d["tyre_check"],
+        "interior_cleaning": d["interior_cleaning"], "damage_check": np.where(repair > 0, 0.0, check),
+        "refuel": d["refuel"],
+    }
+    kmax = int(staff.max())
+    free = np.repeat(t0[:, None], kmax, axis=1)
+    absent = np.arange(kmax)[None, :] >= staff[:, None]  # workers this branch does not have
+    free[absent] = np.inf
     rows = np.arange(n)
-    for j in range(d.shape[1]):
-        i = np.argmin(loads, axis=1)
-        loads[rows, i] += d[:, j]
-    loads[np.isinf(loads)] = 0.0
-    return loads.max(axis=1) if n else np.zeros(0)
+    special_done = np.zeros(n)
+    for t in TASK_ORDER:
+        dur = jobs[t]
+        j = np.argmin(free, axis=1)
+        start = free[rows, j]
+        if t == "interior_cleaning":
+            start = np.maximum(start, special_done)
+        end = start + dur
+        free[rows, j] = np.where(dur > 0, end, free[rows, j])
+        if t == "special_cleaning":
+            special_done = np.where(dur > 0, end, 0.0)
+    free[absent] = -np.inf
+    return free.max(axis=1)
 
 
 def _queue_features(df: pd.DataFrame, clock: OpenClock) -> pd.DataFrame:
@@ -243,13 +275,14 @@ def _find_data_dir() -> Path | None:
 
 
 def load_task_labels(data_dir: Path | None = None) -> pd.DataFrame:
-    """Validation turnarounds joined with their true per-task durations (`true_<task>` columns)."""
+    """Validation turnarounds joined with their true per-task durations (`true_<task>` columns) and
+    their true `total_turnaround_min`."""
     data_dir = Path(data_dir) if data_dir else _find_data_dir()
     if data_dir is None:
         raise FileNotFoundError("validation.csv / validation_labels.csv not found; set TTD_DATA_DIR")
     va = pd.read_csv(data_dir / "validation.csv")
     lab = pd.read_csv(data_dir / "validation_labels.csv")
-    lab = lab.rename(columns={t: "true_" + t for t in TASKS}).drop(columns=["total_turnaround_min"])
+    lab = lab.rename(columns={t: "true_" + t for t in TASKS})
     return va.merge(lab, on="turnaround_id", how="inner")
 
 
@@ -268,50 +301,130 @@ class GroupMedian:
         return X[self.key].map(self.medians_).fillna(self.global_).to_numpy(dtype=float)
 
 
-# Tyre checks are rare (about 1% of cars, 29 in the labelled week) and their duration is mostly set by
-# branch size (about 15-20 min with 3 staff, 30-40 with 2, about 45 with 1), so a group median beats trees.
-GROUP_MEDIAN_TASKS = {"tyre_check": "staff_on_duty"}
+def _linear_matrix(df: pd.DataFrame, branch_levels: list[str]) -> pd.DataFrame:
+    """Additive design: numbers as they are, every category level as its own 0/1 column."""
+    Z = pd.DataFrame(index=df.index)
+    for c in ["rental_days", "km_driven", "return_hour", "queue_length"]:
+        Z[c] = df[c].astype(float)
+    for c in ["fuel_level_pct", "battery_soc_pct"]:
+        Z[c] = df[c].astype(float).fillna(0.0)
+        Z[c + "_missing"] = df[c].isna().astype(float)
+    for c in ["interior_dirt", "exterior_dirt"]:
+        for v in [2, 3, 4, 5]:
+            Z[f"{c}={v}"] = (df[c] == v).astype(float)
+    for c in FLAG_COLS:
+        Z[c] = df[c].astype(float)
+    for t in TASKS:
+        if t != "normal_exterior_cleaning":  # exactly one exterior cleaning: the other flag says it all
+            Z["flag_" + t] = df[t].astype(float)
+    for c, lv in [("branch", branch_levels)] + list(CAT_LEVELS.items()):
+        for v in lv[1:]:
+            Z[f"{c}={v}"] = (df[c] == v).astype(float)
+    for w in range(1, 7):
+        Z[f"weekday={w}"] = (df.weekday == w).astype(float)
+    return Z
+
+
+class MedianLinear:
+    """Additive median (absolute-error) regression on standardised columns. The task durations turn out
+    to be additive (e.g. a child seat adds the same ~7.5 min to interior cleaning at every dirt level),
+    which this captures with far fewer parameters than trees need."""
+
+    def __init__(self, alpha: float = 1e-3):
+        self.alpha = alpha
+
+    def fit(self, Z: pd.DataFrame, y):
+        sd = Z.std()
+        self.cols_ = list(Z.columns[sd > 0])
+        self.mu_, self.sd_ = Z[self.cols_].mean(), Z[self.cols_].std()
+        A = ((Z[self.cols_] - self.mu_) / self.sd_).to_numpy()
+        self.q_ = QuantileRegressor(quantile=0.5, alpha=self.alpha, solver="highs").fit(A, np.asarray(y, float))
+        return self
+
+    def predict(self, Z: pd.DataFrame) -> np.ndarray:
+        return self.q_.predict(((Z[self.cols_] - self.mu_) / self.sd_).to_numpy())
+
+
+class TaskModel:
+    """One task's model: 'linear' (additive median regression), 'trees' (gradient boosting) or
+    'group' (median per group)."""
+
+    def __init__(self, kind: str, trees=None, linear=None, group=None):
+        self.kind, self.trees, self.linear, self.group = kind, trees, linear, group
+
+    def predict(self, X: pd.DataFrame, Z: pd.DataFrame) -> np.ndarray:
+        if self.kind == "linear":
+            return self.linear.predict(Z)
+        if self.kind == "trees":
+            return self.trees.predict(X)
+        return self.group.predict(X)
+
+
+# Chosen per task by leave-one-day-out MAE on the labelled week (see SUBMISSION.md).
+# Frequent tasks are additive, so a median linear model is used; the L1 penalty is larger for tasks
+# driven by one or two inputs (charging is ~40 - 0.35 min per % of battery and nothing else matters).
+# Tyre checks are rare (29 labelled) and mostly set by branch size, so a median per staffing level wins.
+# Quick damage repair starts as trees here and is refitted from train totals in fit().
+TASK_KIND = {
+    "quick_exterior_cleaning": "linear", "normal_exterior_cleaning": "linear", "interior_cleaning": "linear",
+    "damage_check": "linear", "refuel": "linear", "special_cleaning": "linear", "electric_charging": "linear",
+    "quick_damage_repair": "trees", "tyre_check": "group",
+}
+LINEAR_ALPHA = {
+    "quick_exterior_cleaning": 0.003, "normal_exterior_cleaning": 0.001, "interior_cleaning": 0.003,
+    "damage_check": 0.01, "refuel": 0.001, "special_cleaning": 0.01, "electric_charging": 0.04,
+}
+GROUP_KEY = {"tyre_check": "staff_on_duty"}
 
 
 def _fit_task_models(labeled: pd.DataFrame, branches, branch_levels):
     labeled = _prepare(labeled)
     X = _task_matrix(labeled, branches, branch_levels)
+    Z = _linear_matrix(labeled, branch_levels)
     cat_mask = [c in TASK_CATS for c in X.columns]
     models, bounds = {}, {}
     for t in TASKS:
-        rows = labeled[t] == 1
+        rows = (labeled[t] == 1).to_numpy()
         y = labeled.loc[rows, "true_" + t].astype(float)
-        if t in GROUP_MEDIAN_TASKS:
-            mdl = GroupMedian(GROUP_MEDIAN_TASKS[t])
-        elif rows.sum() >= 150:
-            mdl = _hgb(cat_mask, int(rows.sum()))
-        else:  # rare task: shallow trees, strong regularisation (refined later from train totals)
-            mdl = _hgb(cat_mask, int(rows.sum()), max_iter=150, max_leaf_nodes=4, min_samples_leaf=8,
-                       l2_regularization=5.0)
-        mdl.fit(X[rows], y)
-        models[t] = mdl
+        kind = TASK_KIND[t]
+        trees = linear = group = None
+        if kind == "group":
+            group = GroupMedian(GROUP_KEY[t]).fit(X[rows], y)
+        if kind == "linear":
+            linear = MedianLinear(LINEAR_ALPHA[t]).fit(Z[rows], y)
+        if kind == "trees":
+            if rows.sum() >= 150:
+                trees = _hgb(cat_mask, int(rows.sum()))
+            else:  # rare task: shallow trees, strong regularisation
+                trees = _hgb(cat_mask, int(rows.sum()), max_iter=150, max_leaf_nodes=4, min_samples_leaf=8,
+                             l2_regularization=5.0)
+            trees.fit(X[rows], y)
+        models[t] = TaskModel(kind, trees, linear, group)
         bounds[t] = (float(y.min()), float(y.max()))
     return models, bounds
 
 
 def _implied_durations(task, df, durs, target, staff, chg) -> np.ndarray:
     """Back out `task`'s duration from the observed time: the value r for which
-    max(LPT(other staff tasks + r), charging) equals `target` (open minutes minus predicted wait).
+    max(staff schedule with `task` = r, charging) equals `target` (open minutes minus predicted wait).
     NaN where the task was not done or did not set the finish time (censored)."""
-    others = durs[["dur_" + t for t in STAFF_TASKS if t != task]].to_numpy()
+    base = {t: durs["dur_" + t].to_numpy() for t in TASKS}
 
-    def makespan(r, o, k, c):
-        return np.maximum(lpt_makespan(np.column_stack([o, r]), k), c)
+    def makespan(r, idx):
+        d = {t: v[idx] for t, v in base.items()}
+        d[task] = r
+        return np.maximum(staff_schedule(d, staff[idx]), chg[idx])
 
     out = np.full(len(df), np.nan)
-    rows = (df[task].to_numpy() == 1) & (makespan(np.zeros(len(df)), others, staff, chg) < target - 0.5)
+    every = np.arange(len(df))
+    rows = (df[task].to_numpy() == 1) & (makespan(np.zeros(len(df)), every) < target - 0.5)
     if not rows.any():
         return out
-    o, k, c, tgt = others[rows], staff[rows], chg[rows], target[rows]
-    lo, hi = np.zeros(rows.sum()), np.full(rows.sum(), 400.0)
-    for _ in range(40):  # bisection; makespan is non-decreasing in r
+    idx, tgt = np.flatnonzero(rows), target[rows]
+    lo, hi = np.zeros(len(idx)), np.full(len(idx), 400.0)
+    for _ in range(40):  # bisection; the schedule is non-decreasing in r
         mid = (lo + hi) / 2
-        below = makespan(mid, o, k, c) < tgt
+        below = makespan(mid, idx) < tgt
         lo, hi = np.where(below, mid, lo), np.where(below, hi, mid)
     out[rows] = lo
     return out
@@ -319,22 +432,38 @@ def _implied_durations(task, df, durs, target, staff, chg) -> np.ndarray:
 
 def _predict_tasks(model, df, branches) -> pd.DataFrame:
     X = _task_matrix(df, branches, model["branch_levels"])
+    Z = _linear_matrix(df, model["branch_levels"])
     out = pd.DataFrame(index=df.index)
     for t in TASKS:
         lo, hi = model["task_bounds"][t]
-        p = np.clip(model["task_models"][t].predict(X), lo, hi)
+        p = np.clip(model["task_models"][t].predict(X, Z), lo, hi)
         out["dur_" + t] = np.where(df[t] == 1, p, 0.0)
     return out
 
 
 def _makespans(df, durs: pd.DataFrame, staff_map) -> tuple[np.ndarray, np.ndarray]:
     staff = df.branch.map(staff_map).to_numpy().astype(int)
-    ms = lpt_makespan(durs[["dur_" + t for t in STAFF_TASKS]].to_numpy(), staff)
+    ms = staff_schedule({t: durs["dur_" + t].to_numpy() for t in TASKS}, staff)
     return ms, durs["dur_electric_charging"].to_numpy()
 
 
+def _wait_rows(model, df: pd.DataFrame, branches, branch_levels):
+    """Wait-model inputs and target for a period with known totals: predicted task times, the open-minute
+    clock, the car's predicted makespan, and open minutes from return until ready."""
+    durs = _predict_tasks(model, df, branches)
+    clock = _make_clock(branches, df)
+    ms, chg = _makespans(df, durs, clock.staff)
+    open_total = np.empty(len(df))
+    for b, g in df.groupby("branch"):
+        ready = g.return_ts + pd.to_timedelta(g.total_turnaround_min, unit="min")
+        open_total[df.index.get_indexer(g.index)] = clock.to_clock(b, ready) - clock.to_clock(b, g.return_ts)
+    Xw = _wait_matrix(df, branches, branch_levels, clock, ms, chg)
+    return durs, clock, ms, chg, open_total, Xw
+
+
 def fit(train: pd.DataFrame, branches: pd.DataFrame, task_labels: pd.DataFrame | None = None):
-    """Fit per-task models (labelled validation week) and the waiting-time model (train totals)."""
+    """Fit per-task models (labelled validation week) and the waiting-time model (train totals, plus the
+    labelled week's totals when they are given)."""
     if task_labels is None:
         task_labels = load_task_labels()
     train = _prepare(train).reset_index(drop=True)
@@ -342,18 +471,22 @@ def fit(train: pd.DataFrame, branches: pd.DataFrame, task_labels: pd.DataFrame |
     task_models, task_bounds = _fit_task_models(task_labels, branches, branch_levels)
     model = {"branch_levels": branch_levels, "task_models": task_models, "task_bounds": task_bounds}
 
-    # 1) waiting-time model: open minutes until ready, minus the car's own predicted makespan
-    durs = _predict_tasks(model, train, branches)
-    clock = _make_clock(branches, train)
-    ms, chg = _makespans(train, durs, clock.staff)
-    open_total = np.empty(len(train))
-    for b, g in train.groupby("branch"):
-        ready = g.return_ts + pd.to_timedelta(g.total_turnaround_min, unit="min")
-        open_total[train.index.get_indexer(g.index)] = clock.to_clock(b, ready) - clock.to_clock(b, g.return_ts)
-    Xw = _wait_matrix(train, branches, branch_levels, clock, ms, chg)
-    wcat = [c == "branch" for c in Xw.columns]
-    wait_model = _hgb(wcat, len(Xw), max_iter=500, max_leaf_nodes=31, min_samples_leaf=40)
-    wait_model.fit(Xw, open_total - np.maximum(ms, chg))
+    # 1) waiting-time model: open minutes until ready, minus the car's own predicted makespan.
+    #    The labelled week is the period closest to the test weeks, so its totals are added too; its
+    #    queue features are computed within that week, like they will be for a test period.
+    durs, clock, ms, chg, open_total, Xw = _wait_rows(model, train, branches, branch_levels)
+    X_all, y_all = [Xw], [open_total - np.maximum(ms, chg)]
+    if "total_turnaround_min" in task_labels.columns:
+        lab = _prepare(task_labels).reset_index(drop=True)
+        lab = lab[lab.total_turnaround_min.notna()].reset_index(drop=True)
+        if len(lab):
+            _, _, ms_l, chg_l, ot_l, Xw_l = _wait_rows(model, lab, branches, branch_levels)
+            X_all.append(Xw_l)
+            y_all.append(ot_l - np.maximum(ms_l, chg_l))
+    X_all, y_all = pd.concat(X_all, ignore_index=True), np.concatenate(y_all)
+    wcat = [c == "branch" for c in X_all.columns]
+    wait_model = _hgb(wcat, len(X_all), max_iter=500, max_leaf_nodes=31, min_samples_leaf=40)
+    wait_model.fit(X_all, y_all)
     model["wait_model"] = wait_model
 
     # 2) quick damage repair: only ~70 labelled examples, but ~1,100 in train. Its duration there is
@@ -368,8 +501,9 @@ def fit(train: pd.DataFrame, branches: pd.DataFrame, task_labels: pd.DataFrame |
     X = pd.concat([_task_matrix(train[ok], branches, branch_levels), _task_matrix(lab, branches, branch_levels)])
     y = np.concatenate([implied[ok], lab["true_" + t].to_numpy(dtype=float)])
     cat_mask = [c in TASK_CATS for c in X.columns]
-    model["task_models"][t] = _hgb(cat_mask, len(y), max_iter=150, max_leaf_nodes=4, min_samples_leaf=20,
-                                   l2_regularization=5.0).fit(X, y)
+    trees = _hgb(cat_mask, len(y), max_iter=150, max_leaf_nodes=4, min_samples_leaf=20,
+                 l2_regularization=5.0).fit(X, y)
+    model["task_models"][t] = TaskModel("trees", trees=trees)
     model["task_bounds"][t] = (float(np.min(y)), float(np.max(y)))
     return model
 
