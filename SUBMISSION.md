@@ -14,7 +14,7 @@
   "ready tomorrow morning". Without those cars, the total MAE is 3.5 min.
 - Two runs give byte-identical output (`run.py --repeat`, plus a separate process run). Fit + predict
   takes about 5 s on a laptop.
-- On the same rows and metrics, the `codex-sixt` branch's model scores 2.86 mean per-task MAE and
+- On the same rows and metrics, a HistGradientBoostingRegressor model (the `codex-sixt` branch) scores 2.86 mean per-task MAE and
   10.20 total MAE.
 
 ## How the turnaround time is built
