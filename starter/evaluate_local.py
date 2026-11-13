@@ -1,6 +1,6 @@
 """Local re-implementation of the README's scoring (the official evaluate.py is not in this repo).
 
-    python evaluate_local.py predictions.csv --labels ../validation_labels.csv --flags ../validation.csv
+    python evaluate_local.py predictions.csv --labels ../data/validation_labels.csv --flags ../data/validation.csv
 """
 import argparse
 

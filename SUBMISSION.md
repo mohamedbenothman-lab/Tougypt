@@ -198,22 +198,27 @@ that barely vary, such as the damage check.
 ```bash
 pip install -r requirements.txt        # Python 3.11+
 cd starter
+# submission file (data/test.csv must be in place), then the reproduction check
+mkdir -p ../submission && python run.py --test ../data/test.csv --out ../submission/test_predictions.csv
+python run.py --compare                # re-runs on ../data/test.csv; exits 1 unless it equals ../submission/test_predictions.csv
+# validation
 python run.py --repeat                 # fit on train + labels, predict validation.csv -> predictions.csv, check determinism
 python validate_cv.py                  # honest leave-one-day-out scores -> predictions_cv.csv
-python evaluate_local.py predictions_cv.csv --labels ../validation_labels.csv --flags ../validation.csv
-python run.py --input <test.csv> --out <test_predictions.csv>
+python evaluate_local.py predictions_cv.csv --labels ../data/validation_labels.csv --flags ../data/validation.csv
 ```
 
 The output has one row per turnaround: `turnaround_id`, `total_turnaround_min`, and `dur_<task>` for
-all 9 tasks (0 when the task was not done).
+all 9 tasks (0 when the task was not done). `submission/test_predictions.csv` was made with the command
+above, and `run.py --compare` reproduces it with 0 differing values (8,354 rows × 10 values).
+Fit + predict takes about 5 s.
 
 ## Caveats
 
-- **Data location:** the CSVs sit at the repo root, not in `data/`. `run.py` looks in `../data` first,
-  then the repo root (override with `--data-dir` or `TTD_DATA_DIR`).
+- **Data location:** all data is in `data/`. `data/test.csv` is not committed (see `.gitignore`); put
+  the released test file there before running the submission command.
 - **Missing organiser files:** the official `evaluate.py`, `run.py` template and `setup.sh` are not
-  in this repo. `evaluate_local.py` re-implements the README's metrics, and the output columns above
-  are a best guess at the official format.
+  in this repo. `run.py` follows the submission instructions (`--test`, `--out`, `--compare`), and
+  `evaluate_local.py` re-implements the README's metrics.
 - **`fit(train, branches)` also reads the validation labels** (`validation.csv` +
   `validation_labels.csv` from the data folder). They are the only per-task truth, and the README
   allows using them. As a result, predictions on the validation week from `run.py` are *in-sample*.
@@ -221,5 +226,4 @@ all 9 tasks (0 when the task was not done).
 - **Model choices used the validation week:** the per-task model types and L1 penalties were picked by
   leave-one-day-out MAE on it, from small grids. The wait model was picked on held-out train weeks
   instead.
-- **Not done yet:** the README also asks for a 1-minute demo (`submission/demo.mp4`) or up to 5 slides
-  (`submission/slides.pdf`).
+- **Slides:** `submission/slides.pdf` (5 slides) summarises the approach and results.

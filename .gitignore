@@ -1,0 +1,3 @@
+__pycache__/
+# The released test set stays local; place it at data/test.csv to run the submission command.
+data/test.csv
