@@ -9,7 +9,7 @@ How the data works (found by checking the validation labels; see SUBMISSION.md):
   makespan = max(LPT(staff tasks, staff_on_duty), charging)
 * Before work starts, a car waits for the cars already queued at the branch, roughly 12 min / staff
   per car ahead. Service times in that queue are random, so the wait is estimated from the branch's
-  recent arrivals (a model trained on the `train.csv` totals).
+  recent arrivals and how close closing time is (a model trained on the `train.csv` totals).
 * Work only happens while the branch is open. A car returned to the key box, or work running past
   closing, continues at the next opening.
   ready = return + (wait + makespan) counted in *open* minutes.
@@ -94,6 +94,16 @@ class OpenClock:
         day = np.searchsorted(cum[1:], clk, side="right")  # day whose open period contains clk
         day = np.clip(day, 0, len(o) - 1)
         return cum[day]
+
+    def closing(self, branch: str, clk: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """For clock values: the clock at the end of their open period (closing time), and how many
+        calendar minutes the branch then stays closed (a night, or a whole weekend at city centers)."""
+        o, c, length, cum = self.tables[branch]
+        day = np.clip(np.searchsorted(cum[1:], clk, side="right"), 0, len(o) - 1)
+        end = cum[day + 1]
+        close_t = self.from_clock(branch, end)
+        reopen_t = self.from_clock(branch, end + 1e-6)
+        return end, (reopen_t - close_t).total_seconds().to_numpy() / 60.0
 
 
 def _make_clock(branches, *dfs) -> OpenClock:
@@ -197,6 +207,16 @@ def _wait_matrix(df, branches, branch_levels, clock, ms_staff, chg) -> pd.DataFr
     X["ms_staff"] = ms_staff
     X["charging"] = chg
     X["chg_minus_staff"] = chg - ms_staff
+    # closing time: a car whose work may run past closing loses a whole night (or weekend), and
+    # end-of-day queues behave differently, so the wait model sees how close closing is
+    start = q["clock"].to_numpy()
+    end, closure = np.empty(len(df)), np.empty(len(df))
+    for b, g in df.groupby("branch"):
+        idx = df.index.get_indexer(g.index)
+        end[idx], closure[idx] = clock.closing(b, start[idx])
+    X["min_to_close"] = end - start
+    X["slack_before_wait"] = end - start - np.maximum(ms_staff, chg)
+    X["closure_min"] = closure
     return X
 
 
